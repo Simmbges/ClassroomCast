@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Drawing.Imaging;
+using System.Runtime.InteropServices;
 
 namespace ScreenShare.Core;
 
@@ -29,8 +30,70 @@ public sealed class ScreenCapture : IDisposable
     public Bitmap Capture()
     {
         _graphics.CopyFromScreen(_bounds.X, _bounds.Y, 0, 0, _bounds.Size, CopyPixelOperation.SourceCopy);
+        DrawCursor();
         return _bitmap;
     }
+
+    private void DrawCursor()
+    {
+        var cursor = new CursorInfo { Size = Marshal.SizeOf<CursorInfo>() };
+        if (!GetCursorInfo(ref cursor) || (cursor.Flags & 1) == 0 || !_bounds.Contains(cursor.Position))
+            return;
+        if (!GetIconInfo(cursor.Handle, out var icon)) return;
+        try
+        {
+            IntPtr hdc = _graphics.GetHdc();
+            try
+            {
+                DrawIconEx(hdc, cursor.Position.X - _bounds.X - (int)icon.HotspotX,
+                    cursor.Position.Y - _bounds.Y - (int)icon.HotspotY,
+                    cursor.Handle, 0, 0, 0, IntPtr.Zero, 0x0003);
+            }
+            finally { _graphics.ReleaseHdc(hdc); }
+        }
+        catch (ExternalException) { /* 鼠标指针偶发不可用时继续共享屏幕 */ }
+        finally
+        {
+            if (icon.Mask != IntPtr.Zero) DeleteObject(icon.Mask);
+            if (icon.Color != IntPtr.Zero) DeleteObject(icon.Color);
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct CursorInfo
+    {
+        public int Size;
+        public int Flags;
+        public IntPtr Handle;
+        public Point Position;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IconInfo
+    {
+        [MarshalAs(UnmanagedType.Bool)] public bool IsIcon;
+        public uint HotspotX;
+        public uint HotspotY;
+        public IntPtr Mask;
+        public IntPtr Color;
+    }
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetCursorInfo(ref CursorInfo info);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetIconInfo(IntPtr cursor, out IconInfo info);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DrawIconEx(IntPtr hdc, int x, int y, IntPtr icon,
+        int width, int height, uint step, IntPtr brush, uint flags);
+
+    [DllImport("gdi32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DeleteObject(IntPtr handle);
 
     public void Dispose()
     {

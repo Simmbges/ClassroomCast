@@ -1,16 +1,14 @@
-using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
-using System.Threading.Channels;
 
 namespace ScreenShare.Core;
 
 /// <summary>一个已接入的学生连接。</summary>
 public sealed class ClientSession
 {
-    /// <summary>每个学生的发送队列上限（帧数）。满了丢最旧帧，保证实时性。</summary>
-    public const int SendQueueCapacity = 3;
+    /// <summary>控制消息最多积压的条数。积压过多时断开慢客户端。</summary>
+    public const int ControlQueueCapacity = 32;
 
     /// <summary>发送写超时：超过即视为网络过慢，断开该学生以保护整体。</summary>
     public const int SendTimeoutMs = 15000;
@@ -21,11 +19,9 @@ public sealed class ClientSession
     public DateTime ConnectedAt { get; } = DateTime.Now;
     public volatile bool Disconnected;
 
-    /// <summary>
-    /// 同步阻塞队列：发送线程用 GetConsumingEnumerable 取帧，同步 Write 受 WriteTimeout 约束，
-    /// 慢客户端超时后可被踢除。
-    /// </summary>
-    internal readonly BlockingCollection<byte[]> _queue = new(new ConcurrentQueue<byte[]>(), SendQueueCapacity);
+    private readonly object _sendGate = new();
+    private readonly Queue<byte[]> _controlQueue = new();
+    private byte[]? _latestFrame;
 
     public ClientSession(long id, string name, TcpClient tcp)
     {
@@ -34,21 +30,50 @@ public sealed class ClientSession
         Tcp = tcp;
     }
 
-    /// <summary>入队一条消息（帧/状态）。队列满时丢弃最旧的一条再入队，永不阻塞采集线程。</summary>
+    /// <summary>控制消息按顺序可靠发送；画面只保留最新一帧，永不阻塞采集线程。</summary>
     public bool Enqueue(byte[] msg)
     {
-        if (Disconnected) return false;
-        if (_queue.TryAdd(msg)) return true;
-        if (Disconnected) return false;
-        _queue.TryTake(out _);      // 丢最旧一帧
-        return _queue.TryAdd(msg);  // 极端并发下可能失败，视为丢帧
+        bool overflow = false;
+        lock (_sendGate)
+        {
+            if (Disconnected) return false;
+            if (msg[0] == Protocol.Frame)
+                _latestFrame = msg;
+            else if (_controlQueue.Count < ControlQueueCapacity)
+                _controlQueue.Enqueue(msg);
+            else
+                overflow = true;
+            if (!overflow) Monitor.Pulse(_sendGate);
+        }
+        if (overflow) MarkDisconnected();
+        return !overflow;
+    }
+
+    /// <summary>仅由该学生的发送线程调用。先发控制消息，再发最新画面。</summary>
+    internal byte[]? TakeNextMessage()
+    {
+        lock (_sendGate)
+        {
+            while (!Disconnected && _controlQueue.Count == 0 && _latestFrame is null)
+                Monitor.Wait(_sendGate);
+            if (Disconnected) return null;
+            if (_controlQueue.Count > 0) return _controlQueue.Dequeue();
+            var frame = _latestFrame;
+            _latestFrame = null;
+            return frame;
+        }
     }
 
     public void MarkDisconnected()
     {
-        if (Disconnected) return;
-        Disconnected = true;
-        _queue.CompleteAdding();
+        lock (_sendGate)
+        {
+            if (Disconnected) return;
+            Disconnected = true;
+            _controlQueue.Clear();
+            _latestFrame = null;
+            Monitor.PulseAll(_sendGate);
+        }
         try { Tcp.Close(); } catch { /* 忽略 */ }
     }
 }
@@ -395,7 +420,8 @@ public sealed class StreamServer
         {
             var stream = s.Tcp.GetStream();
             stream.WriteTimeout = ClientSession.SendTimeoutMs;
-            foreach (var msg in s._queue.GetConsumingEnumerable())
+            byte[]? msg;
+            while ((msg = s.TakeNextMessage()) is not null)
             {
                 stream.Write(msg, 0, msg.Length);
                 Interlocked.Increment(ref _sentFrames);

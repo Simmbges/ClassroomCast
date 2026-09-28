@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Text;
 using ScreenShare.Core;
 using ScreenShare.UI;
@@ -39,6 +40,8 @@ internal static class Program
         // 无需屏幕/网络的纯逻辑
         await Run("协议消息读写往返", ProtocolRoundTrip);
         await Run("非法消息长度被拒绝", ProtocolRejectsBadLength);
+        await Run("控制消息不会被画面帧挤掉", ControlMessagesSurviveFrames);
+        await Run("断连与画面入队并发不会抛异常", ConcurrentDisconnectAndFrames);
         await Run("局域网 IPv4 地址枚举", AddressEnum);
 
         // 网络回环端到端
@@ -47,6 +50,7 @@ internal static class Program
         await Run("端到端：双客户端/同名/掉线/停止恢复/慢客户端", EndToEnd);
         await Run("端到端：定时签到", SignInE2E);
         await Run("屏幕采集 + JPEG 编码性能实测", PerfCaptureEncode);
+        await Run("屏幕采集包含鼠标指针", CursorCaptured);
 
         // GUI 冒烟（STA）
         await Run("GUI 主窗体构造与地址填充", GuiSmoke);
@@ -82,6 +86,58 @@ internal static class Program
     private static void Check(bool cond, string message)
     {
         if (!cond) throw new Exception(message);
+    }
+
+    private static void ControlMessagesSurviveFrames()
+    {
+        using var tcp = new TcpClient();
+        var session = new ClientSession(1, "测试学生", tcp);
+        session.Enqueue(Protocol.BuildMessage(Protocol.SignInStart, BitConverter.GetBytes(60)));
+        for (int i = 0; i < 100; i++)
+            session.Enqueue(Protocol.BuildMessage(Protocol.Frame, [(byte)i]));
+        session.Enqueue(Protocol.BuildMessage(Protocol.SignInResult, [0]));
+
+        var take = typeof(ClientSession).GetMethod("TakeNextMessage", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var first = (byte[])take.Invoke(session, null)!;
+        var second = (byte[])take.Invoke(session, null)!;
+        var latest = (byte[])take.Invoke(session, null)!;
+        Check(first[0] == Protocol.SignInStart, "签到开始消息被画面覆盖");
+        Check(second[0] == Protocol.SignInResult, "签到结果消息被画面覆盖");
+        Check(latest[0] == Protocol.Frame && latest[5] == 99, "画面没有保留最新一帧");
+        session.MarkDisconnected();
+    }
+
+    private static void ConcurrentDisconnectAndFrames()
+    {
+        for (int i = 0; i < 2000; i++)
+        {
+            using var tcp = new TcpClient();
+            var session = new ClientSession(i, "测试学生", tcp);
+            Parallel.Invoke(
+                () => { for (int j = 0; j < 8; j++) session.Enqueue(Protocol.BuildMessage(Protocol.Frame, [1])); },
+                session.MarkDisconnected);
+            Check(!session.Enqueue(Protocol.BuildMessage(Protocol.Frame, [1])), "已断开连接仍可入队");
+        }
+    }
+
+    private static void CursorCaptured()
+    {
+        var bounds = SystemInformation.VirtualScreen;
+        var cursor = Cursor.Position;
+        Check(bounds.Contains(cursor), "鼠标当前不在被采集的桌面内");
+        using var baseline = new Bitmap(bounds.Width, bounds.Height);
+        using (var graphics = Graphics.FromImage(baseline))
+            graphics.CopyFromScreen(bounds.Location, Point.Empty, bounds.Size);
+        using var capture = new ScreenCapture();
+        var frame = capture.Capture();
+        var x = cursor.X - bounds.X;
+        var y = cursor.Y - bounds.Y;
+        int differences = 0;
+        for (int py = Math.Max(0, y - 32); py < Math.Min(bounds.Height, y + 32); py++)
+            for (int px = Math.Max(0, x - 32); px < Math.Min(bounds.Width, x + 32); px++)
+                if (baseline.GetPixel(px, py) != frame.GetPixel(px, py)) differences++;
+        Check(differences > 0, "采集画面在鼠标附近与不含指针的屏幕复制完全相同");
+        Console.Write($"（鼠标附近有 {differences} 个不同像素）");
     }
 
     /// <summary>DPI 探针：验证 AutoScaleMode.Dpi 在本机是否真正缩放控件尺寸。</summary>

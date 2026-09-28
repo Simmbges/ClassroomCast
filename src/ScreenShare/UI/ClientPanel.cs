@@ -100,22 +100,25 @@ public sealed class ClientPanel : UserControl
         }
         catch (OperationCanceledException)
         {
-            SetUiConnecting(false);
+            _client?.Disconnect();
             _client = null;
             SetStatus("连接已取消", Color.DimGray);
             return;
         }
         catch (Exception ex)
         {
-            SetUiConnecting(false);
+            _client?.Disconnect();
             _client = null;
             SetStatus("连接失败", Color.Firebrick);
             MessageBox.Show(this, ex.Message, "无法连接", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
+        finally
+        {
+            _connecting = false;
+            SetUiConnecting(false);
+        }
 
-        _connecting = false;
-        SetUiConnecting(false);
         _btnConnect.Text = "Client - 断开";
         SetStatus("已连接，等待老师开始共享…", Color.DimGray);
         OpenViewer();
@@ -257,6 +260,7 @@ public sealed class ClientPanel : UserControl
     {
         _btnConnect.Enabled = !connecting;
         if (connecting) _btnConnect.Text = "连接中…";
+        else if (!IsConnected) _btnConnect.Text = "Client - 连接";
     }
 
     private void RunOnUi(Action action)
