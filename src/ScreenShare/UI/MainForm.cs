@@ -5,12 +5,14 @@ public sealed class MainForm : Form
 {
     public MainForm()
     {
+        // 布局按 96 DPI 基线书写，按真实 DPI 手动缩放（.NET 8 不做创建期自动缩放）
+        float s = DpiScale.Factor(this);
         Text = "教室屏幕共享（局域网屏幕直播）";
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
         Font = new Font("Microsoft YaHei UI", 9F);
-        ClientSize = new Size(510, 520);
+        ClientSize = new Size((int)(510 * s), (int)(520 * s));
 
         var tabs = new TabControl { Dock = DockStyle.Fill };
         var serverTab = new TabPage("Server 老师端");
@@ -20,5 +22,6 @@ public sealed class MainForm : Form
         tabs.TabPages.Add(serverTab);
         tabs.TabPages.Add(clientTab);
         Controls.Add(tabs);
+        DpiScale.ScaleChildren(this, s);
     }
 }

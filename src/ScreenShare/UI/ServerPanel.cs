@@ -10,23 +10,27 @@ public sealed class ServerPanel : UserControl
 
     private readonly StreamServer _server = new();
 
-    private readonly ComboBox _cboAddress = new() { DropDownStyle = ComboBoxStyle.DropDownList, Left = 110, Top = 14, Width = 295 };
-    private readonly Button _btnRefresh = new() { Text = "刷新", Left = 415, Top = 12, Width = 64 };
+    private readonly ComboBox _cboAddress = new() { DropDownStyle = ComboBoxStyle.DropDownList, Left = 110, Top = 14, Width = 230 };
+    private readonly Button _btnCopyIp = new() { Text = "复制 IP", Left = 348, Top = 12, Width = 72 };
+    private readonly Button _btnRefresh = new() { Text = "刷新", Left = 428, Top = 12, Width = 58 };
     private readonly NumericUpDown _numPort = new() { Left = 110, Top = 50, Width = 90, Minimum = 1024, Maximum = 65535, Value = 9527 };
     private readonly ComboBox _cboFps = new() { DropDownStyle = ComboBoxStyle.DropDownList, Left = 300, Top = 50, Width = 90 };
-    private readonly Button _btnToggle = new() { Text = "Server - 开始共享", Left = 20, Top = 90, Width = 200, Height = 38 };
+    private readonly Button _btnToggle = new() { Text = "Server - 开始共享", Left = 20, Top = 90, MinimumSize = new Size(200, 0), AutoSize = true };
     private readonly Label _lblStatus = new() { Left = 236, Top = 98, Width = 250, Height = 24, Text = "状态：未共享", ForeColor = Color.DimGray };
     private readonly ListView _lstStudents = new() { View = View.Details, FullRowSelect = true, HideSelection = true };
-    private readonly Label _lblCount = new() { Text = "在线人数：0", AutoSize = true, Left = 330, Top = 18, Width = 130 };
-    private readonly GroupBox _grpStudents = new() { Text = "在线学生", Left = 20, Top = 140, Width = 460, Height = 170 };
+    private readonly GroupBox _grpStudents = new() { Text = "在线学生（0）", Left = 20, Top = 140, Width = 460, Height = 170 };
     private readonly ListBox _lstLog = new() { Left = 20, Top = 330, Width = 460, Height = 170, IntegralHeight = false };
+    private readonly System.Windows.Forms.Timer _copyResetTimer = new() { Interval = 1500 };
 
     public ServerPanel()
     {
+        // 布局数值按 96 DPI 基线书写；自身 Size 也保持基线，由父窗体统一缩放
+        float s = DpiScale.Factor(this);
         Size = new Size(510, 520);
 
         Controls.Add(new Label { Text = "本机地址：", Left = 20, Top = 18, AutoSize = true });
         Controls.Add(_cboAddress);
+        Controls.Add(_btnCopyIp);
         Controls.Add(_btnRefresh);
 
         Controls.Add(new Label { Text = "端口：", Left = 20, Top = 53, AutoSize = true });
@@ -45,14 +49,13 @@ public sealed class ServerPanel : UserControl
         _lstStudents.Width = _grpStudents.Width - 24;
         _lstStudents.Height = _grpStudents.Height - 34;
         _grpStudents.Controls.Add(_lstStudents);
-        _grpStudents.Controls.Add(_lblCount);
-        _lblCount.Left = _grpStudents.Width - _lblCount.Width - 14;
         Controls.Add(_grpStudents);
 
         Controls.Add(new Label { Text = "日志：", Left = 20, Top = 312, AutoSize = true });
         Controls.Add(_lstLog);
 
         _btnRefresh.Click += (_, _) => RefreshAddresses();
+        _btnCopyIp.Click += (_, _) => CopyIpToClipboard();
         _btnToggle.Click += async (_, _) => await ToggleAsync();
         _cboFps.SelectedIndexChanged += (_, _) =>
         {
@@ -64,7 +67,13 @@ public sealed class ServerPanel : UserControl
         _server.ClientsChanged += () => RunOnUi(RefreshStudents);
         _server.StatsUpdated += (encFps, sentFps, totalBytes) =>
             RunOnUi(() => UpdateStats(encFps, sentFps, totalBytes));
+        _copyResetTimer.Tick += (_, _) =>
+        {
+            _copyResetTimer.Stop();
+            _btnCopyIp.Text = "复制 IP";
+        };
 
+        DpiScale.ScaleChildren(this, s);
         RefreshAddresses();
     }
 
@@ -73,8 +82,34 @@ public sealed class ServerPanel : UserControl
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing) _server.Stop();
+        if (disposing)
+        {
+            _server.Stop();
+            _copyResetTimer.Dispose();
+        }
         base.Dispose(disposing);
+    }
+
+    /// <summary>把当前选中的本机 IP 复制到剪贴板，按钮短暂显示"已复制 ✓"作为反馈。</summary>
+    private void CopyIpToClipboard()
+    {
+        if (_cboAddress.SelectedItem is not NetworkUtils.NicAddress nic)
+        {
+            MessageBox.Show(this, "当前没有可复制的 IP 地址。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        try
+        {
+            Clipboard.SetText(nic.Address.ToString());
+            AddLog($"已复制 IP {nic.Address} 到剪贴板");
+            _btnCopyIp.Text = "已复制 ✓";
+            _copyResetTimer.Stop();
+            _copyResetTimer.Start();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, "复制失败：" + ex.Message, "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 
     private void RefreshAddresses()
@@ -143,7 +178,7 @@ public sealed class ServerPanel : UserControl
         foreach (var (name, at) in details)
             _lstStudents.Items.Add(new ListViewItem([name, at.ToString("HH:mm:ss")]));
         _lstStudents.EndUpdate();
-        _lblCount.Text = $"在线人数：{details.Count}";
+        _grpStudents.Text = $"在线学生（{details.Count}）";
         if (!_server.IsStreaming)
             _lblStatus.Text = details.Count > 0 ? $"状态：已停止共享（{details.Count} 名学生仍连接）" : "状态：未共享";
     }

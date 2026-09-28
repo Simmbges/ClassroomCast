@@ -27,12 +27,16 @@ public sealed class ViewerForm : Form
 
     public ViewerForm(string studentName)
     {
+        // 布局按 96 DPI 基线书写，按真实 DPI 手动缩放
+        float s = DpiScale.Factor(this);
         Text = $"正在观看老师的屏幕（{studentName}）";
         StartPosition = FormStartPosition.Manual;
         var area = Screen.PrimaryScreen!.WorkingArea;
-        Size = new Size(Math.Min(960, area.Width - 80), Math.Min(560, area.Height - 80));
-        Location = new Point(area.Right - Width - 24, area.Bottom - Height - 24);
-        MinimumSize = new Size(320, 240);
+        int w = Math.Min((int)(960 * s), area.Width - 80);
+        int h = Math.Min((int)(560 * s), area.Height - 80);
+        Size = new Size(w, h);
+        Location = new Point(area.Right - w - 24, area.Bottom - h - 24);
+        MinimumSize = new Size((int)(320 * s), (int)(240 * s));
         Controls.Add(_hint);
         Controls.Add(_box);
         _box.BringToFront();

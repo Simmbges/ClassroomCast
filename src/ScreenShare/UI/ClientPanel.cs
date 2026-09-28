@@ -8,7 +8,7 @@ public sealed class ClientPanel : UserControl
     private readonly TextBox _txtName = new() { Left = 110, Top = 12, Width = 295 };
     private readonly TextBox _txtIp = new() { Left = 110, Top = 47, Width = 295 };
     private readonly NumericUpDown _numPort = new() { Left = 110, Top = 82, Width = 90, Minimum = 1024, Maximum = 65535, Value = 9527 };
-    private readonly Button _btnConnect = new() { Text = "Client - 连接", Left = 20, Top = 122, Width = 200, Height = 38 };
+    private readonly Button _btnConnect = new() { Text = "Client - 连接", Left = 20, Top = 122, MinimumSize = new Size(200, 0), AutoSize = true };
     private readonly Label _lblStatus = new() { Left = 236, Top = 130, Width = 250, Height = 24, Text = "状态：未连接", ForeColor = Color.DimGray };
     private readonly Label _lblFps = new() { Left = 236, Top = 154, Width = 250, Height = 20, Text = "", ForeColor = Color.DimGray };
 
@@ -18,6 +18,8 @@ public sealed class ClientPanel : UserControl
 
     public ClientPanel()
     {
+        // 布局数值按 96 DPI 基线书写；自身 Size 也保持基线，由父窗体统一缩放
+        float s = DpiScale.Factor(this);
         Size = new Size(510, 520);
 
         Controls.Add(new Label { Text = "我的姓名：", Left = 20, Top = 16, AutoSize = true });
@@ -42,6 +44,7 @@ public sealed class ClientPanel : UserControl
         });
         Controls.Add(grp);
 
+        DpiScale.ScaleChildren(this, s);
         _btnConnect.Click += async (_, _) => await ToggleAsync();
     }
 

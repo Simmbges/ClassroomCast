@@ -24,6 +24,13 @@ internal static class Program
         if (args.Length >= 2 && args[0] == "--client")
             return await RunAsClient(args[1], int.Parse(args[2]), args.Length > 3 ? args[3] : "测试学生");
 
+        // --dpi：DPI 缩放行为探针
+        if (args.Length >= 1 && args[0] == "--dpi")
+        {
+            System.Windows.Forms.Application.SetHighDpiMode(System.Windows.Forms.HighDpiMode.PerMonitorV2);
+            return DpiProbe();
+        }
+
         Console.WriteLine("=== 教室屏幕共享 冒烟测试 ===");
         Console.WriteLine($"时间: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
         Console.WriteLine($"系统: {Environment.OSVersion.VersionString}, {Environment.ProcessorCount} 逻辑核");
@@ -74,6 +81,30 @@ internal static class Program
     private static void Check(bool cond, string message)
     {
         if (!cond) throw new Exception(message);
+    }
+
+    /// <summary>DPI 探针：验证 AutoScaleMode.Dpi 在本机是否真正缩放控件尺寸。</summary>
+    private static int DpiProbe()
+    {
+        Exception? err = null;
+        string report = "";
+        var t = new Thread(() =>
+        {
+            try
+            {
+                // 验证：句柄创建前 DeviceDpi 是否已是真实屏幕 DPI（决定手动缩放因子是否可靠）
+                var f = new Form { Text = "probe", Font = new Font("Microsoft YaHei UI", 9F) };
+                var b = new Button { Left = 20, Top = 20, Width = 100, Height = 38, Text = "测试按钮" };
+                report = $"[构造期] form.DeviceDpi={f.DeviceDpi}, btn.DeviceDpi={b.DeviceDpi}, font.Height={f.Font.Height}";
+            }
+            catch (Exception ex) { err = ex; }
+        });
+        t.SetApartmentState(ApartmentState.STA);
+        t.Start();
+        t.Join();
+        Console.WriteLine(report);
+        if (err != null) Console.WriteLine("异常: " + err);
+        return 0;
     }
 
     /// <summary>命令行客户端模式：连接正在运行的老师端，验证真实画面传输。</summary>
