@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
+using System.Text.Json;
 using System.Text;
 using ScreenShare.Core;
 using ScreenShare.UI;
@@ -49,6 +50,8 @@ internal static class Program
         await Run("连接失败给出中文错误", ConnectFailureChinese);
         await Run("端到端：双客户端/同名/掉线/停止恢复/慢客户端", EndToEnd);
         await Run("端到端：定时签到", SignInE2E);
+        await Run("60 名学生同时接入", ConnectionBurst);
+        await Run("界面忙时仅保留最新画面", ViewerKeepsLatestFrame);
         await Run("屏幕采集 + JPEG 编码性能实测", PerfCaptureEncode);
         await Run("屏幕采集包含鼠标指针", CursorCaptured);
 
@@ -118,6 +121,65 @@ internal static class Program
                 session.MarkDisconnected);
             Check(!session.Enqueue(Protocol.BuildMessage(Protocol.Frame, [1])), "已断开连接仍可入队");
         }
+    }
+
+    private static async Task ConnectionBurst()
+    {
+        int port = FreePort();
+        var server = new StreamServer();
+        var clients = new List<TcpClient>();
+        server.Start("127.0.0.1", port);
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            for (int i = 0; i < 60; i++)
+            {
+                var client = new TcpClient();
+                await client.ConnectAsync(IPAddress.Loopback, port);
+                clients.Add(client);
+                var hello = new byte[] { Protocol.Version }
+                    .Concat(Encoding.UTF8.GetBytes($"学生{i}"))
+                    .ToArray();
+                await client.GetStream().WriteAsync(Protocol.BuildMessage(Protocol.ClientHello, hello));
+            }
+            await WaitUntil(() => server.ClientCount == 60, "60 人应及时进入在线名单", 5000);
+            Console.Write($"（全部接入耗时 {sw.ElapsedMilliseconds} ms）");
+        }
+        finally
+        {
+            server.Stop();
+            foreach (var client in clients) client.Dispose();
+        }
+    }
+
+    private static void ViewerKeepsLatestFrame()
+    {
+        Exception? error = null;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                using var viewer = new ViewerForm("测试学生");
+                _ = viewer.Handle;
+                Bitmap? latest = null;
+                for (int i = 0; i < 200; i++)
+                {
+                    latest = new Bitmap(4, 4);
+                    latest.SetPixel(0, 0, Color.FromArgb(i, 0, 0));
+                    viewer.QueueFrame(latest);
+                }
+                var pending = (Bitmap?)typeof(ViewerForm).GetField("_pendingFrame", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(viewer);
+                Check(ReferenceEquals(latest, pending), "界面队列没有保留最新画面");
+                typeof(ViewerForm).GetMethod("ShowPendingFrame", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(viewer, null);
+                var box = (PictureBox)typeof(ViewerForm).GetField("_box", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(viewer)!;
+                Check(ReferenceEquals(box.Image, latest), "界面没有显示最新画面");
+            }
+            catch (Exception ex) { error = ex; }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join();
+        Check(error is null, $"观看窗口画面队列异常：{error}");
     }
 
     private static void CursorCaptured()
@@ -443,7 +505,8 @@ internal static class Program
     private static async Task SignInE2E()
     {
         int port = FreePort();
-        var server = new StreamServer();
+        string recordsDirectory = Path.Combine(Path.GetTempPath(), "ScreenShareSmoke", Guid.NewGuid().ToString("N"));
+        var server = new StreamServer(recordsDirectory);
         server.Start("127.0.0.1", port);
 
         var c1 = new TestClient().ConnectEvents();
@@ -494,6 +557,14 @@ internal static class Program
         Check(rec.Count == 2 && rec.Any(r => r.StudentId == "S001" && r.Name == "小明")
                               && rec.Any(r => r.StudentId == "S002" && r.Name == "小红"),
             $"签到记录内容不符：{string.Join("、", rec.Select(r => r.StudentId + "/" + r.Name))}");
+        var firstFile = Directory.GetFiles(recordsDirectory, "*.json").Single();
+        using (var firstRound = JsonDocument.Parse(File.ReadAllText(firstFile)))
+        {
+            var saved = firstRound.RootElement.EnumerateArray().ToArray();
+            Check(saved.Length == 2 && saved[0].GetProperty("StudentId").GetString() == "S001"
+                && saved[1].GetProperty("StudentId").GetString() == "S002",
+                "第一轮签到没有完整保存到文件");
+        }
 
         // 结束后提交 → 拒绝
         var c3 = new TestClient().ConnectEvents();
@@ -506,6 +577,28 @@ internal static class Program
         // 再次发起 → 记录清空
         server.StartSignIn(1);
         Check(server.SignInCount == 0, "重新发起签到应清空上次记录");
+        Check(Directory.GetFiles(recordsDirectory, "*.json").Length == 2,
+            "新一轮签到应另存文件并保留上一轮记录");
+        using (var firstRoundAgain = JsonDocument.Parse(File.ReadAllText(firstFile)))
+            Check(firstRoundAgain.RootElement.GetArrayLength() == 2,
+                "新一轮签到覆盖了上一轮文件");
+        var secondFile = Directory.GetFiles(recordsDirectory, "*.json").Single(p => p != firstFile);
+        string blockedTempPath = secondFile + ".tmp";
+        Directory.CreateDirectory(blockedTempPath);
+        try
+        {
+            c3.ResetSignInResult();
+            await c3.Client.SubmitSignInAsync("S004", "小刚");
+            await WaitUntil(() => c3.SignInResultText != null, "无法保存时应通知学生失败", 5_000);
+            Check(!c3.SignInSuccess && c3.SignInResultText!.Contains("保存失败") && server.SignInCount == 0,
+                "保存失败时不应返回签到成功或把学生计入名单");
+        }
+        finally { Directory.Delete(blockedTempPath); }
+        c3.ResetSignInResult();
+        await c3.Client.SubmitSignInAsync("S004", "小刚");
+        await WaitUntil(() => c3.SignInSuccess, "保存恢复后应能重试签到", 5_000);
+        using (var secondRound = JsonDocument.Parse(File.ReadAllText(secondFile)))
+            Check(secondRound.RootElement.GetArrayLength() == 1, "第二轮记录没有保存成功");
         server.EndSignIn();
 
         server.Stop();

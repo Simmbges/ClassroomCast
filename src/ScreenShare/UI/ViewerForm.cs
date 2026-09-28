@@ -22,6 +22,9 @@ public sealed class ViewerForm : Form
         Font = new Font("Microsoft YaHei UI", 12F),
         Text = "正在接收老师的屏幕画面…",
     };
+    private readonly object _frameGate = new();
+    private Bitmap? _pendingFrame;
+    private bool _frameUpdateQueued;
 
     protected override bool ShowWithoutActivation => true; // 打开时不抢焦点
 
@@ -53,6 +56,59 @@ public sealed class ViewerForm : Form
         if (_hint.Visible) { _hint.Visible = false; _box.BringToFront(); }
     }
 
+    /// <summary>由解码线程提交画面；界面忙时只保留最新一帧。</summary>
+    public void QueueFrame(Bitmap frame)
+    {
+        Bitmap? old;
+        bool schedule = false;
+        lock (_frameGate)
+        {
+            if (IsDisposed || Disposing || !IsHandleCreated)
+            {
+                old = frame;
+            }
+            else
+            {
+                old = _pendingFrame;
+                _pendingFrame = frame;
+                if (!_frameUpdateQueued)
+                {
+                    _frameUpdateQueued = true;
+                    schedule = true;
+                }
+            }
+        }
+        old?.Dispose();
+        if (!schedule) return;
+        try { BeginInvoke((Action)ShowPendingFrame); }
+        catch (ObjectDisposedException) { DropPendingFrame(); }
+        catch (InvalidOperationException) { DropPendingFrame(); }
+    }
+
+    private void ShowPendingFrame()
+    {
+        Bitmap? frame;
+        lock (_frameGate)
+        {
+            frame = _pendingFrame;
+            _pendingFrame = null;
+            _frameUpdateQueued = false;
+        }
+        if (frame is not null) ShowFrame(frame);
+    }
+
+    private void DropPendingFrame()
+    {
+        Bitmap? frame;
+        lock (_frameGate)
+        {
+            frame = _pendingFrame;
+            _pendingFrame = null;
+            _frameUpdateQueued = false;
+        }
+        frame?.Dispose();
+    }
+
     /// <summary>在画面位置显示提示文字（等待画面、连接断开等）。</summary>
     public void ShowMessage(string message)
     {
@@ -63,5 +119,17 @@ public sealed class ViewerForm : Form
         old?.Dispose();
         _hint.Visible = true;
         _hint.BringToFront();
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            DropPendingFrame();
+            var old = _box.Image;
+            _box.Image = null;
+            old?.Dispose();
+        }
+        base.Dispose(disposing);
     }
 }

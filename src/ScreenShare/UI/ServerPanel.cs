@@ -1,4 +1,5 @@
 using System.IO;
+using System.Diagnostics;
 using System.Net.Sockets;
 using System.Text;
 using ScreenShare.Core;
@@ -31,6 +32,7 @@ public sealed class ServerPanel : UserControl
     private static readonly string[] SignInChoices = ["1 分钟", "2 分钟", "3 分钟", "5 分钟", "10 分钟"];
     private readonly Button _btnSignIn = new() { Text = "发起签到", Left = 20, Top = 314, Size = new Size(112, 26) };
     private readonly ComboBox _cboMinutes = new() { DropDownStyle = ComboBoxStyle.DropDownList, Left = 140, Top = 316, Width = 72 };
+    private readonly Button _btnOpenSignInFolder = new() { Text = "打开签到记录", Left = 220, Top = 312, Size = new Size(150, 28) };
     private readonly Button _btnExportSignIn = new() { Text = "导出签到表", Left = 382, Top = 312, Size = new Size(98, 28) };
     private readonly Label _lblSignIn = new()
     {
@@ -75,6 +77,7 @@ public sealed class ServerPanel : UserControl
         _cboMinutes.SelectedItem = SignInChoices[0];
         Controls.Add(_btnSignIn);
         Controls.Add(_cboMinutes);
+        Controls.Add(_btnOpenSignInFolder);
         Controls.Add(_btnExportSignIn);
         Controls.Add(_lblSignIn);
         _btnExportSignIn.Enabled = false;
@@ -86,6 +89,7 @@ public sealed class ServerPanel : UserControl
         _btnCopyIp.Click += (_, _) => CopyIpToClipboard();
         _btnExport.Click += (_, _) => ExportStudents();
         _btnSignIn.Click += (_, _) => ToggleSignIn();
+        _btnOpenSignInFolder.Click += (_, _) => OpenSignInFolder();
         _btnExportSignIn.Click += (_, _) => ExportSignInRecords();
         _signInTick.Tick += (_, _) => RefreshSignInUi();
         _server.SignInUpdated += () => RunOnUi(RefreshSignInUi);
@@ -218,6 +222,19 @@ public sealed class ServerPanel : UserControl
         catch (Exception ex)
         {
             MessageBox.Show(this, "发起签到失败：" + ex.Message, "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private void OpenSignInFolder()
+    {
+        try
+        {
+            Directory.CreateDirectory(_server.SignInRecordsDirectory);
+            Process.Start(new ProcessStartInfo(_server.SignInRecordsDirectory) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, "打开签到记录失败：" + ex.Message, "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 

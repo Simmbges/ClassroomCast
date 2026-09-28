@@ -137,14 +137,8 @@ public sealed class ClientPanel : UserControl
         client.FrameDecoded += frame =>
         {
             var viewer = _viewer;
-            if (viewer is null || viewer.IsDisposed || !viewer.IsHandleCreated)
-            {
-                frame.Dispose();
-                return;
-            }
-            try { viewer.BeginInvoke(() => viewer.ShowFrame(frame)); }
-            catch (ObjectDisposedException) { frame.Dispose(); }
-            catch (InvalidOperationException) { frame.Dispose(); }
+            if (viewer is null) frame.Dispose();
+            else viewer.QueueFrame(frame);
         };
 
         // ---- 签到 ----

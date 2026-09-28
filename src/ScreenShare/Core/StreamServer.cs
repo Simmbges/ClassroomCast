@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
 
 namespace ScreenShare.Core;
 
@@ -103,6 +104,7 @@ public sealed class StreamServer
     private readonly object _signInGate = new();
     private readonly List<(string StudentId, string Name, DateTime At)> _signInRecords = new();
     private readonly HashSet<string> _signInIds = new(StringComparer.Ordinal);
+    private string? _signInRecordPath;
     private bool _signInActive;
     private DateTime _signInEndUtc;
     private CancellationTokenSource? _signInTimerCts;
@@ -122,6 +124,16 @@ public sealed class StreamServer
     // ---- 签到状态查询 ----
     public bool SignInActive { get { lock (_signInGate) return _signInActive; } }
     public int SignInCount { get { lock (_signInGate) return _signInRecords.Count; } }
+
+    /// <summary>自动保存的每轮签到记录所在目录。</summary>
+    public string SignInRecordsDirectory { get; }
+
+    public StreamServer(string? signInRecordsDirectory = null)
+    {
+        SignInRecordsDirectory = signInRecordsDirectory ?? Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "教室屏幕共享", "签到记录");
+    }
 
     /// <summary>签到剩余秒数（未在进行中时为 0）。</summary>
     public int SignInRemainingSeconds
@@ -145,16 +157,22 @@ public sealed class StreamServer
     {
         if (!IsListening) throw new InvalidOperationException("服务未启动");
         int seconds = Math.Clamp(minutes, 1, 30) * 60;
+        Directory.CreateDirectory(SignInRecordsDirectory);
+        string recordPath = Path.Combine(SignInRecordsDirectory,
+            $"签到_{DateTime.Now:yyyyMMdd_HHmmss}_{Guid.NewGuid():N}.json");
+        SaveSignInRecords(recordPath, []);
         lock (_signInGate)
         {
             _signInRecords.Clear();
             _signInIds.Clear();
+            _signInRecordPath = recordPath;
             _signInActive = true;
             _signInEndUtc = DateTime.UtcNow.AddSeconds(seconds);
         }
         Broadcast(Protocol.SignInStart, BitConverter.GetBytes((uint)seconds));
         SignInUpdated?.Invoke();
         Log?.Invoke($"发起签到，时长 {minutes} 分钟");
+        Log?.Invoke($"签到记录自动保存至 {recordPath}");
 
         _signInTimerCts?.Cancel();
         _signInTimerCts = CancellationTokenSource.CreateLinkedTokenSource(_cts!.Token);
@@ -205,12 +223,31 @@ public sealed class StreamServer
             if (!_signInActive) return (false, "签到已结束");
             if (studentId.Length == 0) return (false, "请填写学号");
             if (_signInIds.Contains(studentId)) return (false, $"学号 {studentId} 已完成签到");
+            var record = (StudentId: studentId, Name: name.Length > 0 ? name : "未署名", At: DateTime.Now);
+            try
+            {
+                SaveSignInRecords(_signInRecordPath!, [.. _signInRecords, record]);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                Log?.Invoke($"签到记录保存失败：{ex.Message}");
+                return (false, "签到记录保存失败，请联系老师后重试");
+            }
             _signInIds.Add(studentId);
-            _signInRecords.Add((studentId, name.Length > 0 ? name : "未署名", DateTime.Now));
+            _signInRecords.Add(record);
         }
         SignInUpdated?.Invoke();
         Log?.Invoke($"学生 [{name}] 签到成功（学号 {studentId}）");
         return (true, "签到成功");
+    }
+
+    private static void SaveSignInRecords(string path,
+        IReadOnlyList<(string StudentId, string Name, DateTime At)> records)
+    {
+        var data = records.Select(r => new { r.StudentId, r.Name, r.At });
+        string tempPath = path + ".tmp";
+        File.WriteAllText(tempPath, JsonSerializer.Serialize(data, new JsonSerializerOptions { WriteIndented = true }));
+        File.Move(tempPath, path, overwrite: true);
     }
 
     private void Broadcast(byte type, ReadOnlySpan<byte> payload)
@@ -380,8 +417,8 @@ public sealed class StreamServer
                     BitConverter.GetBytes((uint)SignInRemainingSeconds)));
             }
 
-            // 发送线程：专用于该学生的帧写出
-            _ = Task.Run(() => SendLoop(session), CancellationToken.None);
+            // 同步写使用独立后台线程，避免占住处理其他学生握手的线程池线程
+            new Thread(() => SendLoop(session)) { IsBackground = true, Name = $"Send-{session.Id}" }.Start();
 
             // 接收循环：等待心跳/签到提交，检测对端断开
             while (!ct.IsCancellationRequested)
