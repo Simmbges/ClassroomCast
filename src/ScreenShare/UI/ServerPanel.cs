@@ -1,4 +1,6 @@
+using System.IO;
 using System.Net.Sockets;
+using System.Text;
 using ScreenShare.Core;
 
 namespace ScreenShare.UI;
@@ -18,6 +20,7 @@ public sealed class ServerPanel : UserControl
     private readonly Button _btnToggle = new() { Text = "Server - 开始共享", Left = 20, Top = 90, MinimumSize = new Size(200, 0), AutoSize = true };
     private readonly Label _lblStatus = new() { Left = 236, Top = 98, Width = 250, Height = 24, Text = "状态：未共享", ForeColor = Color.DimGray };
     private readonly ListView _lstStudents = new() { View = View.Details, FullRowSelect = true, HideSelection = true };
+    private readonly Button _btnExport = new() { Text = "导出名单", Size = new Size(118, 24) };
     private readonly GroupBox _grpStudents = new() { Text = "在线学生（0）", Left = 20, Top = 140, Width = 460, Height = 170 };
     private readonly ListBox _lstLog = new() { Left = 20, Top = 330, Width = 460, Height = 170, IntegralHeight = false };
     private readonly System.Windows.Forms.Timer _copyResetTimer = new() { Interval = 1500 };
@@ -49,6 +52,9 @@ public sealed class ServerPanel : UserControl
         _lstStudents.Width = _grpStudents.Width - 24;
         _lstStudents.Height = _grpStudents.Height - 34;
         _grpStudents.Controls.Add(_lstStudents);
+        _btnExport.Left = _grpStudents.Width - _btnExport.Width - 14;
+        _btnExport.Top = 1;
+        _grpStudents.Controls.Add(_btnExport);
         Controls.Add(_grpStudents);
 
         Controls.Add(new Label { Text = "日志：", Left = 20, Top = 312, AutoSize = true });
@@ -56,6 +62,7 @@ public sealed class ServerPanel : UserControl
 
         _btnRefresh.Click += (_, _) => RefreshAddresses();
         _btnCopyIp.Click += (_, _) => CopyIpToClipboard();
+        _btnExport.Click += (_, _) => ExportStudents();
         _btnToggle.Click += async (_, _) => await ToggleAsync();
         _cboFps.SelectedIndexChanged += (_, _) =>
         {
@@ -111,6 +118,59 @@ public sealed class ServerPanel : UserControl
             MessageBox.Show(this, "复制失败：" + ex.Message, "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
+
+    /// <summary>
+    /// 把当前在线学生名单导出为 CSV 文件（老师自选保存位置）。
+    /// 按"序号、姓名（同名含编号）、连接时间"三列输出，UTF-8 带 BOM，Excel 可直接打开。
+    /// </summary>
+    private void ExportStudents()
+    {
+        var details = _server.GetClientDetails().OrderBy(d => d.ConnectedAt).ToList();
+        if (details.Count == 0)
+        {
+            MessageBox.Show(this, "当前没有在线学生，无法导出名单。", "提示",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        using var dlg = new SaveFileDialog
+        {
+            Title = "导出学生名单",
+            Filter = "CSV 文件 (*.csv)|*.csv|文本文件 (*.txt)|*.txt",
+            FileName = $"学生名单_{DateTime.Now:yyyyMMdd_HHmmss}.csv",
+        };
+        if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+        try
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("序号,姓名,连接时间");
+            for (int i = 0; i < details.Count; i++)
+            {
+                sb.Append(i + 1).Append(',')
+                  .Append(CsvEscape(details[i].DisplayName)).Append(',')
+                  .Append(details[i].ConnectedAt.ToString("yyyy-MM-dd HH:mm:ss"))
+                  .AppendLine();
+            }
+            // UTF-8 带 BOM，保证 Excel 双击打开不乱码
+            File.WriteAllText(dlg.FileName, sb.ToString(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
+
+            AddLog($"已导出 {details.Count} 名学生名单到 {dlg.FileName}");
+            MessageBox.Show(this,
+                $"已成功导出 {details.Count} 名学生名单到：\n{dlg.FileName}",
+                "导出成功", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, "导出失败：" + ex.Message, "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    /// <summary>CSV 字段转义：含逗号/引号/换行的字段加引号包裹。</summary>
+    private static string CsvEscape(string s) =>
+        s.Contains(',') || s.Contains('"') || s.Contains('\n') || s.Contains('\r')
+            ? $"\"{s.Replace("\"", "\"\"")}\""
+            : s;
 
     private void RefreshAddresses()
     {
