@@ -45,6 +45,7 @@ internal static class Program
         await Run("端口被占用时启动报错", PortInUse);
         await Run("连接失败给出中文错误", ConnectFailureChinese);
         await Run("端到端：双客户端/同名/掉线/停止恢复/慢客户端", EndToEnd);
+        await Run("端到端：定时签到", SignInE2E);
         await Run("屏幕采集 + JPEG 编码性能实测", PerfCaptureEncode);
 
         // GUI 冒烟（STA）
@@ -115,6 +116,9 @@ internal static class Program
         c.FrameDecoded += _ => Interlocked.Increment(ref frames);
         c.StatusChanged += s => Console.WriteLine($"[状态] {s}");
         c.ConnectionLost += s => Console.WriteLine($"[断开] {s}");
+        c.SignInStarted += s => Console.WriteLine($"[签到] 老师发起了签到，剩余 {s} 秒");
+        c.SignInEnded += () => Console.WriteLine("[签到] 签到已结束");
+        c.SignInResultReceived += (ok, r) => Console.WriteLine($"[签到] 提交{(ok ? "成功" : "失败")}：{r}");
         try
         {
             await c.ConnectAsync(ip, port, name, CancellationToken.None);
@@ -159,11 +163,26 @@ internal static class Program
         public string? LastStatus;
         public bool StopNotified;
 
+        // 签到事件
+        public volatile int SignInStartedSeconds = -1;
+        public volatile bool SignInEndedReceived;
+        public volatile bool SignInSuccess;
+        public volatile string? SignInResultText;
+
         public TestClient ConnectEvents()
         {
             Client.FrameDecoded += _ => Interlocked.Increment(ref Frames);
             Client.StatusChanged += s => { LastStatus = s; if (s.Contains("已停止共享")) StopNotified = true; };
+            Client.SignInStarted += sec => SignInStartedSeconds = sec;
+            Client.SignInEnded += () => SignInEndedReceived = true;
+            Client.SignInResultReceived += (ok, reason) => { SignInSuccess = ok; SignInResultText = reason; };
             return this;
+        }
+
+        public void ResetSignInResult()
+        {
+            SignInSuccess = false;
+            SignInResultText = null;
         }
 
         public Task Connect(string ip, int port, string name) =>
@@ -362,6 +381,82 @@ internal static class Program
         c4.Client.Disconnect();
 
         lock (logs) Console.WriteLine("    服务端日志: " + string.Join(" | ", logs.TakeLast(4)));
+    }
+
+    // ---------- 5b. 定时签到 ----------
+    private static async Task SignInE2E()
+    {
+        int port = FreePort();
+        var server = new StreamServer();
+        server.Start("127.0.0.1", port);
+
+        var c1 = new TestClient().ConnectEvents();
+        await c1.Connect("127.0.0.1", port, "小明");
+
+        // 未发起签到时提交 → 应被拒绝
+        await c1.Client.SubmitSignInAsync("S000", "小明");
+        await WaitUntil(() => c1.SignInResultText != null, "未发起时提交应收到拒绝结果", 5_000);
+        Check(!c1.SignInSuccess && c1.SignInResultText!.Contains("签到"), $"未发起时提交应失败，实际：{c1.SignInResultText}");
+
+        // 发起 1 分钟签到
+        server.StartSignIn(1);
+        await WaitUntil(() => c1.SignInStartedSeconds > 0, "客户端1 收到签到开始", 5_000);
+        Check(c1.SignInStartedSeconds is >= 55 and <= 60, $"剩余秒数应接近 60，实际 {c1.SignInStartedSeconds}");
+
+        // 正常签到成功（注意：等"成功"状态出现，避免读到前一次提交的旧结果）
+        c1.ResetSignInResult();
+        await c1.Client.SubmitSignInAsync("S001", "小明");
+        await WaitUntil(() => c1.SignInSuccess, "S001 应签到成功", 5_000);
+        Check(server.SignInCount == 1, "服务端应有 1 条记录");
+
+        // 中途连入的学生同样收到签到通知
+        var c2 = new TestClient().ConnectEvents();
+        await c2.Connect("127.0.0.1", port, "小红");
+        await WaitUntil(() => c2.SignInStartedSeconds > 0, "中途加入的客户端2 收到签到开始", 5_000);
+        Check(c2.SignInStartedSeconds is > 0 and <= 60, $"中途加入应收到剩余时间，实际 {c2.SignInStartedSeconds}");
+
+        // 相同学号 → 拒绝（一人/一个学号只能签一次）
+        c2.ResetSignInResult();
+        await c2.Client.SubmitSignInAsync("S001", "小红");
+        await WaitUntil(() => c2.SignInResultText != null, "重复学号应收到结果", 5_000);
+        Check(!c2.SignInSuccess && c2.SignInResultText!.Contains("已完成签到"),
+            $"重复学号应被拒绝，实际：{c2.SignInResultText}");
+        Check(server.SignInCount == 1, "重复学号不应新增记录");
+
+        // 不同学号 → 成功
+        c2.ResetSignInResult();
+        await c2.Client.SubmitSignInAsync("S002", "小红");
+        await WaitUntil(() => c2.SignInSuccess, "S002 应签到成功", 5_000);
+        Check(server.SignInCount == 2, "服务端应有 2 条记录");
+
+        // 提前结束
+        server.EndSignIn();
+        await WaitUntil(() => c1.SignInEndedReceived && c2.SignInEndedReceived, "学生应收到签到结束", 5_000);
+
+        // 记录核对
+        var rec = server.GetSignInRecords();
+        Check(rec.Count == 2 && rec.Any(r => r.StudentId == "S001" && r.Name == "小明")
+                              && rec.Any(r => r.StudentId == "S002" && r.Name == "小红"),
+            $"签到记录内容不符：{string.Join("、", rec.Select(r => r.StudentId + "/" + r.Name))}");
+
+        // 结束后提交 → 拒绝
+        var c3 = new TestClient().ConnectEvents();
+        await c3.Connect("127.0.0.1", port, "小刚");
+        await c3.Client.SubmitSignInAsync("S003", "小刚");
+        await WaitUntil(() => c3.SignInResultText != null, "结束后提交应收到结果", 5_000);
+        Check(!c3.SignInSuccess && c3.SignInResultText!.Contains("签到已结束"),
+            $"结束后提交应被拒绝，实际：{c3.SignInResultText}");
+
+        // 再次发起 → 记录清空
+        server.StartSignIn(1);
+        Check(server.SignInCount == 0, "重新发起签到应清空上次记录");
+        server.EndSignIn();
+
+        server.Stop();
+        c1.Client.Disconnect();
+        c2.Client.Disconnect();
+        c3.Client.Disconnect();
+        Console.Write("（2 人签到：S001/小明、S002/小红）");
     }
 
     // ---------- 6. 性能实测 ----------

@@ -29,6 +29,15 @@ public sealed class StreamClient
     /// <summary>连接异常断开（主动断开不触发）。</summary>
     public event Action<string>? ConnectionLost;
 
+    /// <summary>收到签到开始（剩余秒数）。</summary>
+    public event Action<int>? SignInStarted;
+
+    /// <summary>收到签到结束。</summary>
+    public event Action? SignInEnded;
+
+    /// <summary>签到提交结果（是否成功、原因）。</summary>
+    public event Action<bool, string>? SignInResultReceived;
+
     public bool IsConnected { get; private set; }
     public bool IsStreaming { get; private set; }
 
@@ -39,6 +48,17 @@ public sealed class StreamClient
     private readonly Channel<byte[]> _decodeQueue =
         Channel.CreateBounded<byte[]>(new BoundedChannelOptions(DecodeQueueCapacity) { FullMode = BoundedChannelFullMode.DropOldest });
     private volatile bool _userClosed;
+
+    // ---- 签到状态（学生侧视图）----
+    private volatile bool _signInActive;
+    private DateTime _signInEndUtc;
+
+    /// <summary>当前是否有进行中的签到。</summary>
+    public bool IsSignInActive => _signInActive;
+
+    /// <summary>签到剩余秒数（未在进行中时为 0）。</summary>
+    public int SignInRemainingSeconds
+        => _signInActive ? Math.Max(0, (int)Math.Ceiling((_signInEndUtc - DateTime.UtcNow).TotalSeconds)) : 0;
 
     /// <summary>
     /// 连接老师端。失败时抛出带中文说明的异常，UI 直接展示。
@@ -113,6 +133,32 @@ public sealed class StreamClient
                     case Protocol.Frame:
                         if (IsStreaming) _decodeQueue.Writer.TryWrite(payload);
                         break;
+                    case Protocol.SignInStart:
+                        if (payload.Length >= 4)
+                        {
+                            int seconds = BitConverter.ToInt32(payload, 0);
+                            if (seconds > 0)
+                            {
+                                _signInEndUtc = DateTime.UtcNow.AddSeconds(seconds);
+                                _signInActive = true;
+                                SignInStarted?.Invoke(seconds);
+                            }
+                        }
+                        break;
+                    case Protocol.SignInEnd:
+                        _signInActive = false;
+                        SignInEnded?.Invoke();
+                        break;
+                    case Protocol.SignInResult:
+                    {
+                        bool ok = payload.Length > 0 && payload[0] == 0;
+                        string reason = payload.Length > 1
+                            ? Encoding.UTF8.GetString(payload, 1, payload.Length - 1)
+                            : "";
+                        if (ok) _signInActive = false; // 本学号已签成功
+                        SignInResultReceived?.Invoke(ok, reason);
+                        break;
+                    }
                     case Protocol.Rejected:
                         throw new InvalidOperationException(
                             payload.Length > 0 ? Encoding.UTF8.GetString(payload) : "被老师端拒绝连接");
@@ -156,6 +202,28 @@ public sealed class StreamClient
                 lastReport = now;
             }
         }
+    }
+
+    /// <summary>
+    /// 提交签到（学号 + 姓名）。本地校验非空与长度；服务端返回的结果经 SignInResultReceived 事件送达。
+    /// </summary>
+    public async Task SubmitSignInAsync(string studentId, string name)
+    {
+        if (!IsConnected) throw new InvalidOperationException("尚未连接到老师电脑");
+        byte[] idBytes = Encoding.UTF8.GetBytes((studentId ?? "").Trim());
+        byte[] nameBytes = Encoding.UTF8.GetBytes((name ?? "").Trim());
+        if (idBytes.Length == 0) throw new ArgumentException("请填写学号");
+        if (idBytes.Length > Protocol.MaxStudentIdBytes) throw new ArgumentException("学号过长");
+        if (nameBytes.Length > Protocol.MaxNameBytes) throw new ArgumentException("姓名过长");
+
+        var payload = new byte[2 + idBytes.Length + nameBytes.Length];
+        payload[0] = (byte)idBytes.Length;
+        idBytes.CopyTo(payload, 1);
+        payload[1 + idBytes.Length] = (byte)nameBytes.Length;
+        nameBytes.CopyTo(payload, 2 + idBytes.Length);
+
+        if (!await SendAsync(Protocol.SignInSubmit, payload, _cts?.Token ?? CancellationToken.None).ConfigureAwait(false))
+            throw new InvalidOperationException("提交失败，与老师电脑的连接可能已断开");
     }
 
     private async Task PingLoop(CancellationToken ct)

@@ -9,7 +9,8 @@ public static class NetworkUtils
 {
     public readonly record struct NicAddress(string NicName, string Description, IPAddress Address)
     {
-        public override string ToString() => $"{NicName}（{Description}）— {Address}";
+        // IP 放在最前：下拉框宽度有限时优先保证 IP 完整可见，网卡短名辅助辨认
+        public override string ToString() => $"{Address}（{NicName}）";
     }
 
     /// <summary>返回所有可用的局域网 IPv4 地址（排除回环 127.*、自动配置 169.254.*、隧道与未启用网卡）。</summary>

@@ -68,8 +68,19 @@ public sealed class StreamServer
     /// <summary>每秒统计：编码帧率、全部学生分发帧率合计、累计发送字节。</summary>
     public event Action<int, int, long>? StatsUpdated;
 
+    /// <summary>签到状态或签到人数变化（发起/结束/有学生签到成功）。</summary>
+    public event Action? SignInUpdated;
+
     private readonly object _gate = new();
     private readonly List<ClientSession> _clients = new();
+
+    // ---- 签到状态 ----
+    private readonly object _signInGate = new();
+    private readonly List<(string StudentId, string Name, DateTime At)> _signInRecords = new();
+    private readonly HashSet<string> _signInIds = new(StringComparer.Ordinal);
+    private bool _signInActive;
+    private DateTime _signInEndUtc;
+    private CancellationTokenSource? _signInTimerCts;
 
     private TcpListener? _listener;
     private CancellationTokenSource? _cts;
@@ -82,6 +93,105 @@ public sealed class StreamServer
     public bool IsListening { get; private set; }
     public bool IsStreaming => _streaming;
     public int ClientCount { get { lock (_gate) return _clients.Count; } }
+
+    // ---- 签到状态查询 ----
+    public bool SignInActive { get { lock (_signInGate) return _signInActive; } }
+    public int SignInCount { get { lock (_signInGate) return _signInRecords.Count; } }
+
+    /// <summary>签到剩余秒数（未在进行中时为 0）。</summary>
+    public int SignInRemainingSeconds
+    {
+        get
+        {
+            lock (_signInGate)
+                return _signInActive ? Math.Max(0, (int)Math.Ceiling((_signInEndUtc - DateTime.UtcNow).TotalSeconds)) : 0;
+        }
+    }
+
+    /// <summary>签到记录快照（按提交顺序）。</summary>
+    public IReadOnlyList<(string StudentId, string Name, DateTime At)> GetSignInRecords()
+    {
+        lock (_signInGate)
+            return _signInRecords.ToList();
+    }
+
+    /// <summary>发起定时签到（1-30 分钟）。重新发起会清空上一次的记录。</summary>
+    public void StartSignIn(int minutes)
+    {
+        if (!IsListening) throw new InvalidOperationException("服务未启动");
+        int seconds = Math.Clamp(minutes, 1, 30) * 60;
+        lock (_signInGate)
+        {
+            _signInRecords.Clear();
+            _signInIds.Clear();
+            _signInActive = true;
+            _signInEndUtc = DateTime.UtcNow.AddSeconds(seconds);
+        }
+        Broadcast(Protocol.SignInStart, BitConverter.GetBytes((uint)seconds));
+        SignInUpdated?.Invoke();
+        Log?.Invoke($"发起签到，时长 {minutes} 分钟");
+
+        _signInTimerCts?.Cancel();
+        _signInTimerCts = CancellationTokenSource.CreateLinkedTokenSource(_cts!.Token);
+        var token = _signInTimerCts.Token;
+        _ = Task.Run(async () =>
+        {
+            try { await Task.Delay(TimeSpan.FromSeconds(seconds), token).ConfigureAwait(false); }
+            catch (OperationCanceledException) { return; }
+            EndSignIn();
+        }, CancellationToken.None);
+    }
+
+    /// <summary>结束签到（手动提前结束或到点自动结束），通知所有学生。</summary>
+    public void EndSignIn()
+    {
+        bool wasActive;
+        lock (_signInGate) { wasActive = _signInActive; _signInActive = false; }
+        if (!wasActive) return;
+        try { _signInTimerCts?.Cancel(); } catch { }
+        Broadcast(Protocol.SignInEnd, ReadOnlySpan<byte>.Empty);
+        SignInUpdated?.Invoke();
+        Log?.Invoke($"签到已结束，共 {SignInCount} 人签到");
+    }
+
+    /// <summary>处理学生提交的签到，结果消息回发给该学生。学号唯一，一人（一个学号）只能签到一次。</summary>
+    private void ProcessSignInSubmit(ClientSession session, byte[] payload)
+    {
+        (bool ok, string reason) = RegisterSignIn(payload);
+        var reasonBytes = Encoding.UTF8.GetBytes(reason);
+        var resp = new byte[1 + reasonBytes.Length];
+        resp[0] = ok ? (byte)0 : (byte)1;
+        reasonBytes.CopyTo(resp, 1);
+        session.Enqueue(Protocol.BuildMessage(Protocol.SignInResult, resp));
+    }
+
+    private (bool Ok, string Reason) RegisterSignIn(byte[] payload)
+    {
+        if (payload.Length < 1) return (false, "签到数据无效");
+        int idLen = payload[0];
+        if (idLen == 0 || payload.Length < 1 + idLen + 1) return (false, "请填写学号");
+        string studentId = Encoding.UTF8.GetString(payload, 1, idLen).Trim();
+        int nameLen = payload[1 + idLen];
+        if (payload.Length < 1 + idLen + 1 + nameLen) return (false, "签到数据无效");
+        string name = Encoding.UTF8.GetString(payload, 1 + idLen + 1, nameLen).Trim();
+
+        lock (_signInGate)
+        {
+            if (!_signInActive) return (false, "签到已结束");
+            if (studentId.Length == 0) return (false, "请填写学号");
+            if (_signInIds.Contains(studentId)) return (false, $"学号 {studentId} 已完成签到");
+            _signInIds.Add(studentId);
+            _signInRecords.Add((studentId, name.Length > 0 ? name : "未署名", DateTime.Now));
+        }
+        SignInUpdated?.Invoke();
+        Log?.Invoke($"学生 [{name}] 签到成功（学号 {studentId}）");
+        return (true, "签到成功");
+    }
+
+    private void Broadcast(byte type, ReadOnlySpan<byte> payload)
+    {
+        Deliver(Protocol.BuildMessage(type, payload));
+    }
 
     /// <summary>开始监听。端口被占用等情况抛 SocketException（UI 层转中文提示）。</summary>
     public void Start(string ipAddress, int port)
@@ -139,6 +249,8 @@ public sealed class StreamServer
     {
         _streaming = false;
         IsListening = false;
+        lock (_signInGate) _signInActive = false;
+        try { _signInTimerCts?.Cancel(); } catch { }
         _captureLoop?.Dispose();
         _captureLoop = null;
         try { _cts?.Cancel(); } catch { }
@@ -236,15 +348,22 @@ public sealed class StreamServer
             // 欢迎与当前共享状态进入发送队列（由该学生的发送线程写出）
             session.Enqueue(Protocol.BuildMessage(Protocol.ServerWelcome, ReadOnlySpan<byte>.Empty));
             BroadcastStatus();
+            // 签到进行中：新连入的学生同样收到签到通知（带剩余时间）
+            if (SignInActive)
+            {
+                session.Enqueue(Protocol.BuildMessage(Protocol.SignInStart,
+                    BitConverter.GetBytes((uint)SignInRemainingSeconds)));
+            }
 
             // 发送线程：专用于该学生的帧写出
             _ = Task.Run(() => SendLoop(session), CancellationToken.None);
 
-            // 接收循环：等待心跳，检测对端断开
+            // 接收循环：等待心跳/签到提交，检测对端断开
             while (!ct.IsCancellationRequested)
             {
-                var (t, _) = await Protocol.ReadMessageAsync(stream, ct).ConfigureAwait(false);
-                if (t == Protocol.Ping) continue; // 心跳保活
+                var (t, p) = await Protocol.ReadMessageAsync(stream, ct).ConfigureAwait(false);
+                if (t == Protocol.Ping) continue;           // 心跳保活
+                if (t == Protocol.SignInSubmit) ProcessSignInSubmit(session, p);
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }

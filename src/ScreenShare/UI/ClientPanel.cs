@@ -11,9 +11,12 @@ public sealed class ClientPanel : UserControl
     private readonly Button _btnConnect = new() { Text = "Client - 连接", Left = 20, Top = 122, MinimumSize = new Size(200, 0), AutoSize = true };
     private readonly Label _lblStatus = new() { Left = 236, Top = 130, Width = 250, Height = 24, Text = "状态：未连接", ForeColor = Color.DimGray };
     private readonly Label _lblFps = new() { Left = 236, Top = 154, Width = 250, Height = 20, Text = "", ForeColor = Color.DimGray };
+    private readonly Button _btnOpenSignIn = new() { Text = "打开签到窗口", Left = 20, Top = 340, Size = new Size(120, 26), Enabled = false };
 
     private StreamClient? _client;
     private ViewerForm? _viewer;
+    private SignInForm? _signInForm;
+    private bool _signedIn;       // 本连接已成功签到
     private bool _connecting;
 
     public ClientPanel()
@@ -31,6 +34,7 @@ public sealed class ClientPanel : UserControl
         Controls.Add(_btnConnect);
         Controls.Add(_lblStatus);
         Controls.Add(_lblFps);
+        Controls.Add(_btnOpenSignIn);
 
         var grp = new GroupBox { Text = "使用提示", Left = 20, Top = 178, Width = 460, Height = 150 };
         grp.Controls.Add(new Label
@@ -46,6 +50,7 @@ public sealed class ClientPanel : UserControl
 
         DpiScale.ScaleChildren(this, s);
         _btnConnect.Click += async (_, _) => await ToggleAsync();
+        _btnOpenSignIn.Click += (_, _) => OpenSignInFromButton();
     }
 
     protected override void Dispose(bool disposing)
@@ -138,7 +143,83 @@ public sealed class ClientPanel : UserControl
             catch (ObjectDisposedException) { frame.Dispose(); }
             catch (InvalidOperationException) { frame.Dispose(); }
         };
+
+        // ---- 签到 ----
+        client.SignInStarted += seconds => RunOnUi(() =>
+        {
+            _signedIn = false;
+            _btnOpenSignIn.Enabled = true;
+            SetStatus("老师发起了课堂签到！", Color.Firebrick);
+            ShowSignInForm(seconds);
+        });
+        client.SignInEnded += () => RunOnUi(() =>
+        {
+            _signInForm?.Expire();  // 窗口内自行提示"签到已结束"并关闭
+            if (!_signedIn) SetStatus("签到已结束", Color.DimGray);
+        });
+        client.SignInResultReceived += (ok, reason) => RunOnUi(() =>
+        {
+            var form = _signInForm;
+            if (form is { IsDisposed: false })
+            {
+                form.SetResult(ok, reason);
+            }
+            else if (ok)
+            {
+                SetStatus("签到成功", Color.ForestGreen);
+            }
+            if (ok)
+            {
+                _signedIn = true;
+                _btnOpenSignIn.Enabled = false;
+            }
+        });
     }
+
+    /// <summary>弹出（或置前）签到窗口。连接时已提交的姓名自动预填。</summary>
+    private void ShowSignInForm(int remainingSeconds)
+    {
+        if (_signInForm is { IsDisposed: false })
+        {
+            _signInForm.Activate();
+            return;
+        }
+        var client = _client;
+        if (client is null) return;
+        _signInForm = new SignInForm(ConnectedName, Math.Max(remainingSeconds, client.SignInRemainingSeconds));
+        _signInForm.SubmitRequested += async (id, name) =>
+        {
+            try
+            {
+                if (_client is null) throw new InvalidOperationException("尚未连接到老师电脑");
+                await _client.SubmitSignInAsync(id, name);
+            }
+            catch (Exception ex)
+            {
+                _signInForm?.SetResult(false, ex.Message);
+            }
+        };
+        _signInForm.FormClosed += (_, _) => _signInForm = null;
+        _signInForm.Show();
+    }
+
+    private void OpenSignInFromButton()
+    {
+        if (_signInForm is { IsDisposed: false })
+        {
+            _signInForm.Activate();
+            return;
+        }
+        if (_client is { IsSignInActive: true } && !_signedIn)
+        {
+            ShowSignInForm(_client.SignInRemainingSeconds);
+            return;
+        }
+        SetStatus(_signedIn ? "你已完成签到" : "当前没有进行中的签到", Color.DimGray);
+    }
+
+    /// <summary>连接时使用的姓名（签到窗口预填）。</summary>
+    private string ConnectedName => _txtName.Text.Trim();
 
     private void OpenViewer()
     {
@@ -160,6 +241,10 @@ public sealed class ClientPanel : UserControl
         _lblFps.Text = "";
         _btnConnect.Text = "Client - 连接";
         SetStatus(reason, userInitiated ? Color.DimGray : Color.Firebrick);
+        _signInForm?.Close();
+        _signInForm = null;
+        _signedIn = false;
+        _btnOpenSignIn.Enabled = false;
     }
 
     private void SetStatus(string text, Color color)

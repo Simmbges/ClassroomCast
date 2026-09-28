@@ -12,9 +12,10 @@ public sealed class ServerPanel : UserControl
 
     private readonly StreamServer _server = new();
 
-    private readonly ComboBox _cboAddress = new() { DropDownStyle = ComboBoxStyle.DropDownList, Left = 110, Top = 14, Width = 230 };
-    private readonly Button _btnCopyIp = new() { Text = "复制 IP", Left = 348, Top = 12, Width = 72 };
-    private readonly Button _btnRefresh = new() { Text = "刷新", Left = 428, Top = 12, Width = 58 };
+    private readonly ComboBox _cboAddress = new() { DropDownStyle = ComboBoxStyle.DropDownList, Left = 110, Top = 14, Width = 250 };
+    private readonly Button _btnCopyIp = new() { Text = "复制 IP", Left = 368, Top = 12, Width = 68 };
+    private readonly Button _btnRefresh = new() { Text = "刷新", Left = 444, Top = 12, Width = 56 };
+    private readonly ToolTip _addrTip = new();
     private readonly NumericUpDown _numPort = new() { Left = 110, Top = 50, Width = 90, Minimum = 1024, Maximum = 65535, Value = 9527 };
     private readonly ComboBox _cboFps = new() { DropDownStyle = ComboBoxStyle.DropDownList, Left = 300, Top = 50, Width = 90 };
     private readonly Button _btnToggle = new() { Text = "Server - 开始共享", Left = 20, Top = 90, MinimumSize = new Size(200, 0), AutoSize = true };
@@ -22,14 +23,26 @@ public sealed class ServerPanel : UserControl
     private readonly ListView _lstStudents = new() { View = View.Details, FullRowSelect = true, HideSelection = true };
     private readonly Button _btnExport = new() { Text = "导出名单", Size = new Size(118, 24) };
     private readonly GroupBox _grpStudents = new() { Text = "在线学生（0）", Left = 20, Top = 140, Width = 460, Height = 170 };
-    private readonly ListBox _lstLog = new() { Left = 20, Top = 330, Width = 460, Height = 170, IntegralHeight = false };
+    private readonly ListBox _lstLog = new() { Left = 20, Top = 396, Width = 460, Height = 140, IntegralHeight = false };
     private readonly System.Windows.Forms.Timer _copyResetTimer = new() { Interval = 1500 };
+    private readonly System.Windows.Forms.Timer _signInTick = new() { Interval = 1000 };
+
+    // ---- 签到 ----
+    private static readonly string[] SignInChoices = ["1 分钟", "2 分钟", "3 分钟", "5 分钟", "10 分钟"];
+    private readonly Button _btnSignIn = new() { Text = "发起签到", Left = 20, Top = 314, Size = new Size(112, 26) };
+    private readonly ComboBox _cboMinutes = new() { DropDownStyle = ComboBoxStyle.DropDownList, Left = 140, Top = 316, Width = 72 };
+    private readonly Button _btnExportSignIn = new() { Text = "导出签到表", Left = 382, Top = 312, Size = new Size(98, 28) };
+    private readonly Label _lblSignIn = new()
+    {
+        Left = 20, Top = 350, AutoSize = true,
+        Text = "未发起签到", ForeColor = Color.DimGray,
+    };
 
     public ServerPanel()
     {
         // 布局数值按 96 DPI 基线书写；自身 Size 也保持基线，由父窗体统一缩放
         float s = DpiScale.Factor(this);
-        Size = new Size(510, 520);
+        Size = new Size(510, 552);
 
         Controls.Add(new Label { Text = "本机地址：", Left = 20, Top = 18, AutoSize = true });
         Controls.Add(_cboAddress);
@@ -57,12 +70,25 @@ public sealed class ServerPanel : UserControl
         _grpStudents.Controls.Add(_btnExport);
         Controls.Add(_grpStudents);
 
-        Controls.Add(new Label { Text = "日志：", Left = 20, Top = 312, AutoSize = true });
+        // 签到区
+        foreach (var c in SignInChoices) _cboMinutes.Items.Add(c);
+        _cboMinutes.SelectedItem = SignInChoices[0];
+        Controls.Add(_btnSignIn);
+        Controls.Add(_cboMinutes);
+        Controls.Add(_btnExportSignIn);
+        Controls.Add(_lblSignIn);
+        _btnExportSignIn.Enabled = false;
+
+        Controls.Add(new Label { Text = "日志：", Left = 20, Top = 378, AutoSize = true });
         Controls.Add(_lstLog);
 
         _btnRefresh.Click += (_, _) => RefreshAddresses();
         _btnCopyIp.Click += (_, _) => CopyIpToClipboard();
         _btnExport.Click += (_, _) => ExportStudents();
+        _btnSignIn.Click += (_, _) => ToggleSignIn();
+        _btnExportSignIn.Click += (_, _) => ExportSignInRecords();
+        _signInTick.Tick += (_, _) => RefreshSignInUi();
+        _server.SignInUpdated += () => RunOnUi(RefreshSignInUi);
         _btnToggle.Click += async (_, _) => await ToggleAsync();
         _cboFps.SelectedIndexChanged += (_, _) =>
         {
@@ -81,6 +107,8 @@ public sealed class ServerPanel : UserControl
         };
 
         DpiScale.ScaleChildren(this, s);
+        RefreshSignInUi();
+        _signInTick.Start();
         RefreshAddresses();
     }
 
@@ -93,6 +121,7 @@ public sealed class ServerPanel : UserControl
         {
             _server.Stop();
             _copyResetTimer.Dispose();
+            _signInTick.Dispose();
         }
         base.Dispose(disposing);
     }
@@ -172,6 +201,94 @@ public sealed class ServerPanel : UserControl
             ? $"\"{s.Replace("\"", "\"\"")}\""
             : s;
 
+    /// <summary>发起 / 提前结束签到。</summary>
+    private void ToggleSignIn()
+    {
+        if (_server.SignInActive)
+        {
+            _server.EndSignIn();
+            return;
+        }
+        if (!int.TryParse((_cboMinutes.SelectedItem as string ?? "1").Split(' ')[0], out int minutes))
+            minutes = 1;
+        try
+        {
+            _server.StartSignIn(minutes);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, "发起签到失败：" + ex.Message, "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    /// <summary>按当前签到状态刷新按钮/文字（每秒定时刷新倒计时）。</summary>
+    private void RefreshSignInUi()
+    {
+        if (_server.SignInActive)
+        {
+            int remain = _server.SignInRemainingSeconds;
+            _btnSignIn.Text = "提前结束";
+            _cboMinutes.Enabled = false;
+            _btnExportSignIn.Enabled = false;
+            _lblSignIn.ForeColor = Color.ForestGreen;
+            _lblSignIn.Text = $"签到进行中，剩余 {remain / 60}:{remain % 60:D2}，已签 {_server.SignInCount} 人";
+        }
+        else
+        {
+            _btnSignIn.Text = "发起签到";
+            _cboMinutes.Enabled = true;
+            int count = _server.SignInCount;
+            _btnExportSignIn.Enabled = count > 0;
+            _lblSignIn.ForeColor = count > 0 ? Color.DimGray : Color.DimGray;
+            _lblSignIn.Text = count > 0
+                ? $"签到已结束，共 {count} 人签到，可导出签到表"
+                : "未发起签到";
+        }
+    }
+
+    /// <summary>把签到记录导出为 CSV（序号、学号、姓名、签到时间），老师自选保存位置。</summary>
+    private void ExportSignInRecords()
+    {
+        var records = _server.GetSignInRecords();
+        if (records.Count == 0)
+        {
+            MessageBox.Show(this, "当前没有签到记录。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        using var dlg = new SaveFileDialog
+        {
+            Title = "导出签到表",
+            Filter = "CSV 文件 (*.csv)|*.csv|文本文件 (*.txt)|*.txt",
+            FileName = $"签到表_{DateTime.Now:yyyyMMdd_HHmmss}.csv",
+        };
+        if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+        try
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("序号,学号,姓名,签到时间");
+            for (int i = 0; i < records.Count; i++)
+            {
+                sb.Append(i + 1).Append(',')
+                  .Append(CsvEscape(records[i].StudentId)).Append(',')
+                  .Append(CsvEscape(records[i].Name)).Append(',')
+                  .Append(records[i].At.ToString("yyyy-MM-dd HH:mm:ss"))
+                  .AppendLine();
+            }
+            File.WriteAllText(dlg.FileName, sb.ToString(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
+
+            AddLog($"已导出 {records.Count} 条签到记录到 {dlg.FileName}");
+            MessageBox.Show(this,
+                $"已成功导出 {records.Count} 条签到记录到：\n{dlg.FileName}",
+                "导出成功", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, "导出失败：" + ex.Message, "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
     private void RefreshAddresses()
     {
         var previous = _cboAddress.SelectedItem is NetworkUtils.NicAddress selected ? selected.Address.ToString() : null;
@@ -190,6 +307,11 @@ public sealed class ServerPanel : UserControl
                                    || n.Address.ToString().StartsWith("10.")
                                    || n.Address.ToString().StartsWith("172."));
         _cboAddress.SelectedIndex = idx >= 0 ? idx : 0;
+        // 悬停显示完整网卡信息（下拉框内只显示 IP + 短网卡名）
+        if (_cboAddress.SelectedItem is NetworkUtils.NicAddress current)
+            _addrTip.SetToolTip(_cboAddress, $"网卡：{current.NicName}（{current.Description}）\nIP 地址：{current.Address}");
+        else
+            _addrTip.SetToolTip(_cboAddress, "选择用于共享的本机局域网 IP");
     }
 
     private async Task ToggleAsync()

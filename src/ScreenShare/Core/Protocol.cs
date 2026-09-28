@@ -25,6 +25,13 @@ public static class Protocol
     public const byte Status = 0x04;        // S→C: [1字节: 0=已停止共享 1=直播中]
     public const byte Rejected = 0x05;      // S→C: 拒绝原因（UTF-8）
     public const byte Ping = 0x06;          // C→S: 空
+    public const byte SignInStart = 0x07;   // S→C: [4字节小端: 剩余秒数]
+    public const byte SignInEnd = 0x08;     // S→C: 空
+    public const byte SignInSubmit = 0x09;  // C→S: [1字节学号长度][学号UTF-8][1字节姓名长度][姓名UTF-8]
+    public const byte SignInResult = 0x0A;  // S→C: [1字节: 0=成功 1=失败][原因UTF-8]
+
+    /// <summary>学号最大字节数（UTF-8）。</summary>
+    public const int MaxStudentIdBytes = 32;
 
     /// <summary>把一条消息组装成完整字节（头 + 载荷一次写出，减少分片）。</summary>
     public static byte[] BuildMessage(byte type, ReadOnlySpan<byte> payload)

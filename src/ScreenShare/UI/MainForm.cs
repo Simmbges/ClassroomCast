@@ -12,7 +12,7 @@ public sealed class MainForm : Form
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
         Font = new Font("Microsoft YaHei UI", 9F);
-        ClientSize = new Size((int)(510 * s), (int)(520 * s));
+        ClientSize = new Size((int)(510 * s), (int)(555 * s));
 
         var tabs = new TabControl { Dock = DockStyle.Fill };
         var serverTab = new TabPage("Server 老师端");
