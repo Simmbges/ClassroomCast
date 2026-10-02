@@ -1,4 +1,6 @@
-# 教室屏幕共享（局域网屏幕直播）
+# ClassroomCast — 教室屏幕共享
+
+ClassroomCast is a Windows LAN screen-sharing tool for classroom teaching, with student attendance and adjustable frame rates.
 
 老师端将屏幕实时共享给同一局域网内的多个学生观看，学生可同时正常操作自己的电脑（看一眼、跟着练）。
 纯局域网工具：**不锁屏、不远程控制、不传声音、不录像、不连互联网、不需要账号**。
