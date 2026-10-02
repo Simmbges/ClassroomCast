@@ -1,0 +1,19 @@
+# 编译与发布产物（本地保留，不提交到代码仓库）
+[Bb]in/
+[Oo]bj/
+/publish/
+
+# 本机 IDE 配置
+.vs/
+*.user
+*.suo
+
+# 开发截图、环境配置和本地签到数据
+.test-shots/
+.env
+.env.*
+!.env.example
+签到记录/
+
+# Git 历史备份
+*.bundle
