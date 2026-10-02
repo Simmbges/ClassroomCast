@@ -336,6 +336,7 @@ public sealed class ServerPanel : UserControl
         if (_server.IsStreaming)
         {
             _server.StopStreaming();
+            _btnToggle.Text = "Server - 开始共享";
             return;
         }
 
@@ -366,6 +367,7 @@ public sealed class ServerPanel : UserControl
         }
 
         _server.StartStreaming(fps);
+        _btnToggle.Text = "Server - 停止共享";
         await Task.CompletedTask;
     }
 
